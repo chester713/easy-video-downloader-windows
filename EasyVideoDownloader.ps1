@@ -62,7 +62,21 @@ function ConvertTo-NormalizedPath {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $cleanPath = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"').Trim("'"))
-    return [IO.Path]::GetFullPath($cleanPath)
+    return (Remove-TrailingSeparator ([IO.Path]::GetFullPath($cleanPath)))
+}
+
+function Remove-TrailingSeparator {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    # Windows PowerShell 5.1 passes a quoted argument such as "C:\My Videos\"
+    # to native programs with the final \" read as an escaped quote, which
+    # corrupts every argument after it. Drive roots such as D:\ keep their
+    # separator because they never contain spaces and need it to stay valid.
+    $root = [IO.Path]::GetPathRoot($Path)
+    if ($root -and ($Path.Length -le $root.Length)) {
+        return $Path
+    }
+    return $Path.TrimEnd([char[]]@('\', '/'))
 }
 
 function Find-Executable {
@@ -176,7 +190,7 @@ function Save-Configuration {
     [pscustomobject]@{
         YtDlpPath       = [IO.Path]::GetFullPath($YtDlpPath)
         FfmpegPath      = [IO.Path]::GetFullPath($FfmpegPath)
-        DownloadDirectory = [IO.Path]::GetFullPath($DownloadDirectory)
+        DownloadDirectory = Remove-TrailingSeparator ([IO.Path]::GetFullPath($DownloadDirectory))
     } | ConvertTo-Json | Set-Content -LiteralPath $script:ConfigPath -Encoding UTF8
 }
 
@@ -189,20 +203,44 @@ function Get-DownloadDirectory {
         Join-Path $env:USERPROFILE 'Downloads'
     }
 
-    Write-Host ''
-    Write-Host "Download folder (press Enter to use: $defaultDirectory)"
-    $entered = (Read-Host 'Folder').Trim()
-    $selected = if ($entered) { ConvertTo-NormalizedPath $entered } else { $defaultDirectory }
+    # Keep asking until a usable folder is chosen, so a typo or a declined
+    # prompt never closes the app or forces the tools to be set up again.
+    while ($true) {
+        Write-Host ''
+        Write-Host "Download folder (press Enter to use: $defaultDirectory)"
+        $entered = (Read-Host 'Folder').Trim()
 
-    if (-not (Test-Path -LiteralPath $selected -PathType Container)) {
-        $answer = (Read-Host 'That folder does not exist. Create it? [Y/n]').Trim()
-        if (($answer -ne '') -and ($answer -notmatch '^(?i)y(es)?$')) {
-            throw 'A download folder is required.'
+        try {
+            $selected = if ($entered) {
+                ConvertTo-NormalizedPath $entered
+            } else {
+                ConvertTo-NormalizedPath $defaultDirectory
+            }
+        } catch {
+            Write-Status 'That is not a valid folder path. Please try again.' 'Warning'
+            continue
         }
-        $null = New-Item -ItemType Directory -Path $selected -Force
-    }
 
-    return [IO.Path]::GetFullPath($selected)
+        if (-not (Test-Path -LiteralPath $selected -PathType Container)) {
+            if (Test-Path -LiteralPath $selected) {
+                Write-Status 'That path is a file, not a folder. Please choose a folder.' 'Warning'
+                continue
+            }
+            $answer = (Read-Host 'That folder does not exist. Create it? [Y/n]').Trim()
+            if (($answer -ne '') -and ($answer -notmatch '^(?i)y(es)?$')) {
+                Write-Status 'Choose another download folder.' 'Warning'
+                continue
+            }
+            try {
+                $null = [IO.Directory]::CreateDirectory($selected)
+            } catch {
+                Write-Status "The folder could not be created: $($_.Exception.Message)" 'Warning'
+                continue
+            }
+        }
+
+        return $selected
+    }
 }
 
 function Get-ExistingTools {
@@ -254,7 +292,7 @@ function Test-DownloadedFileHash {
 
     $actualHash = (Get-FileHash -LiteralPath $FilePath -Algorithm SHA256).Hash
     if ($actualHash -ine $ExpectedHash) {
-        throw "Security check failed for $([IO.Path]::GetFileName($FilePath)). The downloaded file was not installed."
+        throw "Checksum check failed for $([IO.Path]::GetFileName($FilePath)). The download may be incomplete or corrupted, so it was not installed. Please try again."
     }
 }
 
@@ -283,7 +321,7 @@ function Install-Tools {
     $installDirectory = if ($entered) { ConvertTo-NormalizedPath $entered } else { $defaultDirectory }
 
     if (-not (Test-Path -LiteralPath $installDirectory -PathType Container)) {
-        $null = New-Item -ItemType Directory -Path $installDirectory -Force
+        $null = [IO.Directory]::CreateDirectory($installDirectory)
     }
 
     $tempDirectory = Join-Path ([IO.Path]::GetTempPath()) ('EasyVideoDownloader-' + [guid]::NewGuid().ToString())
@@ -296,7 +334,9 @@ function Install-Tools {
 
     $oldProgressPreference = $ProgressPreference
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        # Add TLS 1.2 for Windows PowerShell 5.1 without disabling any newer
+        # protocol the system already allows.
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         $ProgressPreference = 'SilentlyContinue'
 
         Write-Status 'Downloading the latest stable yt-dlp release...' 'Info'
@@ -352,7 +392,14 @@ function Install-Tools {
         }
     } finally {
         $ProgressPreference = $oldProgressPreference
-        Remove-AppTempDirectory $tempDirectory
+        # Antivirus software often keeps a lock on a freshly downloaded .exe for
+        # a few seconds. Cleanup is best-effort so it never hides the real
+        # result of the installation.
+        try {
+            Remove-AppTempDirectory $tempDirectory
+        } catch {
+            Write-Status "Temporary files could not be removed and can be deleted later: $tempDirectory" 'Warning'
+        }
     }
 }
 
@@ -367,50 +414,63 @@ function Initialize-Application {
         if (@($saved.PSObject.Properties.Name) -contains 'DownloadDirectory') {
             $savedDownloadDirectory = $saved.DownloadDirectory
         }
-        $downloadDirectory = Get-DownloadDirectory $savedDownloadDirectory
-        Save-Configuration -YtDlpPath $saved.YtDlpPath -FfmpegPath $saved.FfmpegPath -DownloadDirectory $downloadDirectory
-        return [pscustomobject]@{
-            YtDlpPath        = $saved.YtDlpPath
-            FfmpegPath       = $saved.FfmpegPath
-            DownloadDirectory = $downloadDirectory
-        }
+        return (Complete-Configuration -YtDlpPath $saved.YtDlpPath -FfmpegPath $saved.FfmpegPath -SavedDownloadDirectory $savedDownloadDirectory)
     }
 
     if ($saved) {
         Write-Status 'The saved tools are missing or cannot run. Please set them up again.' 'Warning'
     }
 
-    while ($true) {
+    $tools = $null
+    while (-not $tools) {
         Write-Host ''
         Write-Host '[1] Use yt-dlp and FFmpeg already installed on this computer'
         Write-Host '[2] Automatically download and install the latest stable versions'
         Write-Host '[Q] Quit'
         $choice = (Read-Host 'Choose an option').Trim()
 
+        # An if/elseif chain is used instead of switch: inside a switch,
+        # "continue" and "break" act on the switch, not on this loop.
         try {
-            switch -Regex ($choice) {
-                '^1$' { $tools = Get-ExistingTools; break }
-                '^2$' { $tools = Install-Tools; break }
-                '^(?i)q$' { return $null }
-                default {
-                    Write-Status 'Choose 1, 2, or Q.' 'Warning'
-                    continue
-                }
-            }
-
-            if ($tools) {
-                $downloadDirectory = Get-DownloadDirectory $null
-                Save-Configuration -YtDlpPath $tools.YtDlpPath -FfmpegPath $tools.FfmpegPath -DownloadDirectory $downloadDirectory
-                return [pscustomobject]@{
-                    YtDlpPath        = $tools.YtDlpPath
-                    FfmpegPath       = $tools.FfmpegPath
-                    DownloadDirectory = $downloadDirectory
-                }
+            if ($choice -eq '1') {
+                $tools = Get-ExistingTools
+            } elseif ($choice -eq '2') {
+                $tools = Install-Tools
+            } elseif ($choice -match '^(?i)q$') {
+                return $null
+            } else {
+                Write-Status 'Choose 1, 2, or Q.' 'Warning'
             }
         } catch {
+            $tools = $null
             Write-Status $_.Exception.Message 'Error'
             Write-Host 'You can try again or choose another setup method.' -ForegroundColor DarkGray
         }
+    }
+
+    # The download folder is chosen after the tools are ready, outside the
+    # retry loop above, so a folder problem never repeats the tool setup.
+    return (Complete-Configuration -YtDlpPath $tools.YtDlpPath -FfmpegPath $tools.FfmpegPath -SavedDownloadDirectory $null)
+}
+
+function Complete-Configuration {
+    param(
+        [Parameter(Mandatory = $true)][string]$YtDlpPath,
+        [Parameter(Mandatory = $true)][string]$FfmpegPath,
+        [string]$SavedDownloadDirectory
+    )
+
+    $downloadDirectory = Get-DownloadDirectory $SavedDownloadDirectory
+    try {
+        Save-Configuration -YtDlpPath $YtDlpPath -FfmpegPath $FfmpegPath -DownloadDirectory $downloadDirectory
+    } catch {
+        Write-Status "Settings could not be saved, so setup will run again next time: $($_.Exception.Message)" 'Warning'
+    }
+
+    return [pscustomobject]@{
+        YtDlpPath         = $YtDlpPath
+        FfmpegPath        = $FfmpegPath
+        DownloadDirectory = $downloadDirectory
     }
 }
 
@@ -431,7 +491,7 @@ function Get-VideoInformation {
     )
 
     Write-Status 'Checking the video and detecting available formats...' 'Info'
-    $ffmpegDirectory = Split-Path -Parent $Configuration.FfmpegPath
+    $ffmpegDirectory = Remove-TrailingSeparator (Split-Path -Parent $Configuration.FfmpegPath)
     $arguments = @(
         '--dump-single-json',
         '--skip-download',
@@ -503,6 +563,27 @@ function Get-PropertyValue {
     return $null
 }
 
+function Get-CodecState {
+    param($Codec)
+
+    if (($null -eq $Codec) -or ([string]$Codec -eq '')) { return 'unknown' }
+    if ([string]$Codec -eq 'none') { return 'none' }
+    return 'known'
+}
+
+function Format-Codec {
+    param(
+        [string]$State,
+        $Codec
+    )
+
+    switch ($State) {
+        'known'   { return [string]$Codec }
+        'unknown' { return '?' }
+        default   { return '-' }
+    }
+}
+
 function Get-FormatChoices {
     param([Parameter(Mandatory = $true)]$VideoInformation)
 
@@ -536,7 +617,9 @@ function Get-FormatChoices {
 
     $nextNumber = 3
     $formats = Get-PropertyValue $VideoInformation 'formats'
+    if ($null -eq $formats) { $formats = @() }
     foreach ($format in @($formats)) {
+        if ($null -eq $format) { continue }
         $formatId = Get-PropertyValue $format 'format_id'
         $protocol = Get-PropertyValue $format 'protocol'
         $extension = Get-PropertyValue $format 'ext'
@@ -545,16 +628,24 @@ function Get-FormatChoices {
         if (-not $formatId) { continue }
         if (($protocol -eq 'mhtml') -or ($extension -eq 'mhtml')) { continue }
 
-        $hasVideo = $videoCodec -and ($videoCodec -ne 'none')
-        $hasAudio = $audioCodec -and ($audioCodec -ne 'none')
-        if (-not $hasVideo -and -not $hasAudio) { continue }
+        # yt-dlp reports a codec as 'none' when the stream is absent and as
+        # null when the site simply did not say. Unknown is not the same as
+        # absent, so those formats are kept rather than hidden.
+        $videoState = Get-CodecState $videoCodec
+        $audioState = Get-CodecState $audioCodec
+        if (($videoState -eq 'none') -and ($audioState -eq 'none')) { continue }
+        $hasVideo = $videoState -ne 'none'
+        $hasAudio = $audioState -ne 'none'
+        $codecsUnknown = ($videoState -eq 'unknown') -or ($audioState -eq 'unknown')
 
-        $type = if ($hasVideo -and $hasAudio) {
-            'Video+Audio'
-        } elseif ($hasVideo) {
+        $type = if ($hasVideo -and -not $hasAudio) {
             'Video only'
-        } else {
+        } elseif ($hasAudio -and -not $hasVideo) {
             'Audio only'
+        } elseif ($codecsUnknown) {
+            'Unknown'
+        } else {
+            'Video+Audio'
         }
 
         $resolution = '-'
@@ -583,6 +674,7 @@ function Get-FormatChoices {
         if ($dynamicRange -and ($dynamicRange -ne 'SDR')) { $null = $noteParts.Add([string]$dynamicRange) }
         if ($language) { $null = $noteParts.Add([string]$language) }
         if ($hasVideo -and -not $hasAudio) { $null = $noteParts.Add('adds best audio') }
+        if ($type -eq 'Unknown') { $null = $noteParts.Add('site did not report codecs') }
 
         $selector = if ($hasVideo -and -not $hasAudio) {
             "${formatId}+bestaudio/${formatId}"
@@ -597,8 +689,8 @@ function Get-FormatChoices {
             Resolution = $resolution
             Fps        = if ($framesPerSecond) { [string]$framesPerSecond } else { '-' }
             Container  = if ($extension) { [string]$extension } else { '-' }
-            VideoCodec = if ($hasVideo) { [string]$videoCodec } else { '-' }
-            AudioCodec = if ($hasAudio) { [string]$audioCodec } else { '-' }
+            VideoCodec = Format-Codec $videoState $videoCodec
+            AudioCodec = Format-Codec $audioState $audioCodec
             Size       = Format-ByteSize $sizeValue
             Note       = ($noteParts -join ', ')
             Selector   = $selector
@@ -652,6 +744,24 @@ function Select-FormatChoice {
     }
 }
 
+function Get-FormatDescription {
+    param([Parameter(Mandatory = $true)]$FormatChoice)
+
+    # The two convenience choices are described fully by their note.
+    if (@('auto', 'best') -contains $FormatChoice.Id) {
+        return $FormatChoice.Note
+    }
+
+    $parts = New-Object System.Collections.ArrayList
+    $null = $parts.Add("#$($FormatChoice.Number) $($FormatChoice.Type)")
+    if ($FormatChoice.Resolution -and ($FormatChoice.Resolution -ne '-')) { $null = $parts.Add($FormatChoice.Resolution) }
+    if ($FormatChoice.Container -and ($FormatChoice.Container -ne '-')) { $null = $parts.Add($FormatChoice.Container) }
+    $null = $parts.Add("ID $($FormatChoice.Id)")
+    $description = $parts -join ', '
+    if ($FormatChoice.Note) { $description += " ($($FormatChoice.Note))" }
+    return $description
+}
+
 function Start-VideoDownload {
     param(
         [Parameter(Mandatory = $true)]$Configuration,
@@ -659,22 +769,24 @@ function Start-VideoDownload {
         [Parameter(Mandatory = $true)]$FormatChoice
     )
 
-    $ffmpegDirectory = Split-Path -Parent $Configuration.FfmpegPath
+    $ffmpegDirectory = Remove-TrailingSeparator (Split-Path -Parent $Configuration.FfmpegPath)
+    # Settings saved by older versions may still end with a backslash.
+    $downloadDirectory = Remove-TrailingSeparator $Configuration.DownloadDirectory
     $outputTemplate = '%(title).180B [%(id)s].%(ext)s'
     $arguments = @(
         '--no-playlist',
         '--newline',
         '--windows-filenames',
         '--ffmpeg-location', $ffmpegDirectory,
-        '--paths', $Configuration.DownloadDirectory,
+        '--paths', $downloadDirectory,
         '--output', $outputTemplate,
         '--format', $FormatChoice.Selector,
         '--', $Url
     )
 
     Write-Title 'Downloading'
-    Write-Host "Format: $($FormatChoice.Note)"
-    Write-Host "Saving to: $($Configuration.DownloadDirectory)"
+    Write-Host "Format: $(Get-FormatDescription $FormatChoice)"
+    Write-Host "Saving to: $downloadDirectory"
     Write-Host ''
     $oldPreference = $ErrorActionPreference
     try {
@@ -705,6 +817,67 @@ function Invoke-SelfTest {
     if ((Format-ByteSize 1048576) -ne '1.0 MB') { throw 'Self-test failed: file size formatting is incorrect.' }
     if (-not (Test-VideoUrl 'https://example.com/watch?v=1')) { throw 'Self-test failed: valid URL rejected.' }
     if (Test-VideoUrl 'not a URL') { throw 'Self-test failed: invalid URL accepted.' }
+
+    # Formats whose codecs the site did not report must still be offered.
+    $unknownInformation = [pscustomobject]@{
+        formats = @(
+            [pscustomobject]@{ format_id = 'hls-1080p'; ext = 'mp4'; width = 1920; height = 1080; vcodec = $null; acodec = $null },
+            [pscustomobject]@{ format_id = 'dash-720'; ext = 'mp4'; width = 1280; height = 720; vcodec = $null; acodec = 'none' },
+            $null
+        )
+    }
+    $unknownChoices = @(Get-FormatChoices $unknownInformation)
+    if ($unknownChoices.Count -ne 4) { throw "Self-test failed: formats with unknown codecs were dropped (got $($unknownChoices.Count) choices)." }
+    if ($unknownChoices[2].Type -ne 'Unknown' -or $unknownChoices[2].Selector -ne 'hls-1080p') { throw 'Self-test failed: unknown-codec format was not offered as-is.' }
+    if ($unknownChoices[3].Selector -ne 'dash-720+bestaudio/dash-720') { throw 'Self-test failed: video with unknown codec did not add audio.' }
+
+    # Missing format lists must not crash.
+    if (@(Get-FormatChoices ([pscustomobject]@{ title = 'x' })).Count -ne 2) { throw 'Self-test failed: missing format list was not handled.' }
+
+    # Trailing separators break native argument passing in Windows PowerShell 5.1.
+    $sep = [IO.Path]::DirectorySeparatorChar
+    $tempRoot = Remove-TrailingSeparator ([IO.Path]::GetTempPath())
+    if ((Remove-TrailingSeparator ($tempRoot + $sep)) -ne $tempRoot) { throw 'Self-test failed: trailing separator was not removed.' }
+    $driveRoot = [IO.Path]::GetPathRoot($tempRoot)
+    if ((Remove-TrailingSeparator $driveRoot) -ne $driveRoot) { throw 'Self-test failed: a drive root was changed.' }
+
+    # Interactive prompts are exercised with scripted answers. Functions defined
+    # inside this script block shadow Read-Host, Write-Host and Write-Status for
+    # the code it calls, and disappear when the block ends.
+    & {
+        $answers = New-Object System.Collections.Queue
+        $statuses = New-Object System.Collections.ArrayList
+        function Read-Host {
+            param([string]$Prompt)
+            if ($answers.Count -eq 0) { throw "Self-test failed: unexpected prompt '$Prompt'." }
+            return $answers.Dequeue()
+        }
+        function Write-Host { }
+        function Write-Status {
+            param([string]$Text, [string]$Kind = 'Info')
+            $null = $statuses.Add([pscustomobject]@{ Text = $Text; Kind = $Kind })
+        }
+
+        # An invalid setup choice warns once and asks again, with no error.
+        foreach ($answer in @('x', 'q')) { $answers.Enqueue($answer) }
+        $result = Initialize-Application -ForceSetup
+        if ($null -ne $result) { throw 'Self-test failed: quitting setup did not return nothing.' }
+        if (@($statuses | Where-Object { $_.Kind -eq 'Error' }).Count -ne 0) {
+            throw "Self-test failed: invalid setup choice produced an error: $(@($statuses | Where-Object { $_.Kind -eq 'Error' })[0].Text)"
+        }
+        if (@($statuses | Where-Object { $_.Text -eq 'Choose 1, 2, or Q.' }).Count -ne 1) { throw 'Self-test failed: invalid setup choice was not reported.' }
+
+        # Declining to create a folder asks again instead of failing, and the
+        # chosen folder is returned without a trailing separator.
+        $statuses.Clear()
+        $missingFolder = Join-Path $tempRoot ('EasyVideoDownloader-selftest-' + [guid]::NewGuid().ToString())
+        foreach ($answer in @($missingFolder, 'n', ($tempRoot + $sep))) { $answers.Enqueue($answer) }
+        $folder = Get-DownloadDirectory $tempRoot
+        if ($folder -ne $tempRoot) { throw "Self-test failed: unexpected download folder '$folder'." }
+        if (Test-Path -LiteralPath $missingFolder) { throw 'Self-test failed: a declined folder was created.' }
+        if ($answers.Count -ne 0) { throw 'Self-test failed: not every scripted answer was used.' }
+    }
+
     Write-Status 'All self-tests passed.' 'Success'
 }
 

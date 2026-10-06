@@ -11,7 +11,7 @@ Paste a video URL, review the formats offered by the website, and choose an opti
 - Guided first-run setup
 - Uses an existing yt-dlp and FFmpeg installation, or installs both automatically
 - Downloads the latest stable Windows releases during automatic setup
-- Verifies downloaded tools with their published SHA-256 checksums
+- Checks downloaded tools against their published SHA-256 checksums to catch incomplete or corrupted downloads
 - Detects the formats available for each video
 - Shows format ID, resolution, frame rate, container, video codec, audio codec, and estimated size
 - Includes **Best video + best audio** and **Best single file** choices
@@ -75,7 +75,7 @@ The app downloads:
 - the latest stable `yt-dlp.exe` from the official yt-dlp GitHub release;
 - the latest stable FFmpeg essentials build for Windows from Gyan's builds, which are linked from the FFmpeg website.
 
-The published SHA-256 checksum for each download is checked before anything is installed. `yt-dlp.exe`, `ffmpeg.exe`, and `ffprobe.exe` are placed together in the selected directory. Temporary installation files are removed afterward.
+Each download is checked against its published SHA-256 checksum before anything is installed. This catches incomplete or corrupted downloads. The FFmpeg checksum is published on the same site as the archive, so it confirms the file arrived intact rather than proving who built it. `yt-dlp.exe`, `ffmpeg.exe`, and `ffprobe.exe` are placed together in the selected directory. Temporary installation files are removed afterward.
 
 Finally, select where completed videos should be saved. Press Enter to use the normal Windows `Downloads` folder.
 
@@ -111,6 +111,9 @@ The remaining rows represent formats reported by the website:
 - **Video+Audio** downloads that exact combined format.
 - **Video only** downloads the selected video format, adds the best available audio, and merges them.
 - **Audio only** downloads that exact audio format.
+- **Unknown** means the website did not say which codecs the format uses. It is downloaded exactly as offered and may or may not include audio.
+
+A `?` in a codec column means the website did not report that codec.
 
 A `?` in the Size column means that the website did not provide a reliable size in advance. The actual download can therefore be larger or smaller.
 
@@ -138,7 +141,7 @@ If a saved executable is moved or removed, the app detects the problem and start
 
 ### Update yt-dlp and FFmpeg
 
-Enter `S` at the video URL prompt, choose automatic setup, and select the existing tools directory. The downloaded files are checksum-verified before replacing the older copies.
+Enter `S` at the video URL prompt, choose automatic setup, and select the existing tools directory. The downloaded files are checked against their published checksums before replacing the older copies.
 
 ### Update this project
 
@@ -174,7 +177,7 @@ Rows marked **Video only** are automatically paired with the best audio stream. 
 
 ### Antivirus or Windows blocks a downloaded tool
 
-Automatic setup retrieves the executables over HTTPS from the sources listed above and validates their SHA-256 checksums. Do not bypass a security warning you do not understand. Review the source URLs and scan the files according to your organisation's security policy.
+Automatic setup retrieves the executables over HTTPS from the sources listed above and checks them against their published SHA-256 checksums. Do not bypass a security warning you do not understand. Review the source URLs and scan the files according to your organisation's security policy.
 
 ## Current limitations
 
@@ -200,7 +203,7 @@ Run the built-in tests without opening the interactive workflow:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\EasyVideoDownloader.ps1 -SelfTest
 ```
 
-The checks cover URL validation, format conversion, video-only audio pairing, size formatting, and filtering of unsupported storyboard entries.
+The checks cover URL validation, format conversion, video-only audio pairing, formats with unreported codecs, missing format lists, size formatting, filtering of unsupported storyboard entries, trailing-backslash handling for folder paths, and the setup menu and download-folder prompts (using scripted answers).
 
 ## Third-party software
 
