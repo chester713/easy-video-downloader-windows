@@ -10,6 +10,7 @@ Paste a video URL, review the formats offered by the website, and choose an opti
 
 - Guided first-run setup
 - Uses an existing yt-dlp and FFmpeg installation, or installs both automatically
+- Installs Deno, the JavaScript runtime yt-dlp needs to read YouTube fully
 - Downloads the latest stable Windows releases during automatic setup
 - Checks downloaded tools against their published SHA-256 checksums to catch incomplete or corrupted downloads
 - Detects the formats available for each video
@@ -18,7 +19,7 @@ Paste a video URL, review the formats offered by the website, and choose an opti
 - Automatically adds the best audio when a video-only format is selected
 - Uses FFmpeg to merge separate streams
 - Remembers tool locations and the preferred download folder
-- Requires no Python installation and does not modify the Windows `PATH`
+- Requires no Python or Node.js installation and does not modify the Windows `PATH`
 
 ## Requirements
 
@@ -27,7 +28,7 @@ Paste a video URL, review the formats offered by the website, and choose an opti
 - An internet connection
 - Permission to download the selected media
 
-If you use automatic setup, keep at least 500 MB of disk space free during installation. The exact download and installed sizes vary between releases.
+If you use automatic setup, keep at least 700 MB of disk space free during installation. The exact download and installed sizes vary between releases.
 
 ## Installation
 
@@ -66,6 +67,8 @@ Choose option `1`, then paste the directory containing `yt-dlp.exe` and `ffmpeg.
 
 If the two programs are stored in different locations, the app asks for the missing program separately. Both executables are tested before their locations are saved.
 
+The app also looks for `deno.exe` (version 2.3.0 or newer) in the same folder, beside `yt-dlp.exe`, and on the Windows `PATH`. If none is found, it offers to download Deno into `%LOCALAPPDATA%\EasyVideoDownloader\tools`. See [JavaScript runtime](#javascript-runtime) below.
+
 ### Install the tools automatically
 
 Choose option `2`, then press Enter to accept the suggested installation directory or paste another directory.
@@ -73,11 +76,22 @@ Choose option `2`, then press Enter to accept the suggested installation directo
 The app downloads:
 
 - the latest stable `yt-dlp.exe` from the official yt-dlp GitHub release;
-- the latest stable FFmpeg essentials build for Windows from Gyan's builds, which are linked from the FFmpeg website.
+- the latest stable FFmpeg essentials build for Windows from Gyan's builds, which are linked from the FFmpeg website;
+- the latest stable `deno.exe` from the official Deno GitHub release.
 
-Each download is checked against its published SHA-256 checksum before anything is installed. This catches incomplete or corrupted downloads. The FFmpeg checksum is published on the same site as the archive, so it confirms the file arrived intact rather than proving who built it. `yt-dlp.exe`, `ffmpeg.exe`, and `ffprobe.exe` are placed together in the selected directory. Temporary installation files are removed afterward.
+Each download is checked against its published SHA-256 checksum before anything is installed. This catches incomplete or corrupted downloads. The FFmpeg checksum is published on the same site as the archive, so it confirms the file arrived intact rather than proving who built it. `yt-dlp.exe`, `ffmpeg.exe`, `ffprobe.exe`, and `deno.exe` are placed together in the selected directory. Temporary installation files are removed afterward.
 
 Finally, select where completed videos should be saved. Press Enter to use the normal Windows `Downloads` folder.
+
+### JavaScript runtime
+
+YouTube now requires yt-dlp to run some JavaScript before it can list every format. yt-dlp does this with an external JavaScript runtime, and the one it recommends is [Deno](https://deno.com/). Without it, yt-dlp shows this warning and some formats may be missing or fail to download:
+
+```text
+WARNING: No supported JavaScript runtime could be found. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing.
+```
+
+Automatic setup installs Deno for you. If you use existing tools, or set the app up with an older version, the app offers to install Deno when it starts. You can decline and continue, and you will be asked again on the next start.
 
 ## How to use the app
 
@@ -171,6 +185,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\EasyVideoDownloader.ps
 - The current app does not collect browser cookies or account credentials, so login-only, paid, age-restricted, or otherwise protected media may not work.
 - Website changes can temporarily break yt-dlp support until yt-dlp is updated.
 
+### "No supported JavaScript runtime could be found"
+
+Deno is missing or could not be started. Close and reopen the app and accept the offer to install Deno, or enter `S` and choose automatic setup. See [JavaScript runtime](#javascript-runtime).
+
 ### A selected format has no sound
 
 Rows marked **Video only** are automatically paired with the best audio stream. If merging fails, confirm that FFmpeg still exists at the saved location, then enter `S` to repair or refresh the installation.
@@ -203,7 +221,7 @@ Run the built-in tests without opening the interactive workflow:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\EasyVideoDownloader.ps1 -SelfTest
 ```
 
-The checks cover URL validation, format conversion, video-only audio pairing, formats with unreported codecs, missing format lists, size formatting, filtering of unsupported storyboard entries, trailing-backslash handling for folder paths, and the setup menu and download-folder prompts (using scripted answers).
+The checks cover URL validation, format conversion, video-only audio pairing, formats with unreported codecs, missing format lists, size formatting, filtering of unsupported storyboard entries, trailing-backslash handling for folder paths, Deno version detection and argument passing, and the setup menu, Deno offer and download-folder prompts (using scripted answers).
 
 ## Third-party software
 
@@ -212,5 +230,6 @@ This project is a wrapper around independently maintained software:
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 - [FFmpeg](https://ffmpeg.org/)
 - [Gyan FFmpeg builds for Windows](https://www.gyan.dev/ffmpeg/builds/)
+- [Deno](https://github.com/denoland/deno)
 
 Those projects and downloaded binaries are governed by their respective licenses.

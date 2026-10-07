@@ -13,6 +13,11 @@ $script:YtDlpDownloadUrl = 'https://github.com/yt-dlp/yt-dlp/releases/latest/dow
 $script:YtDlpChecksumsUrl = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS'
 $script:FfmpegDownloadUrl = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
 $script:FfmpegChecksumUrl = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256'
+# yt-dlp needs a JavaScript runtime to read YouTube fully. Deno is the runtime
+# yt-dlp recommends and enables by default.
+$script:DenoDownloadUrl = 'https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip'
+$script:DenoChecksumUrl = 'https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip.sha256sum'
+$script:MinimumDenoVersion = [version]'2.3.0'
 
 try {
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -180,7 +185,8 @@ function Save-Configuration {
     param(
         [Parameter(Mandatory = $true)][string]$YtDlpPath,
         [Parameter(Mandatory = $true)][string]$FfmpegPath,
-        [Parameter(Mandatory = $true)][string]$DownloadDirectory
+        [Parameter(Mandatory = $true)][string]$DownloadDirectory,
+        [string]$DenoPath
     )
 
     if (-not (Test-Path -LiteralPath $script:ConfigDirectory -PathType Container)) {
@@ -188,8 +194,9 @@ function Save-Configuration {
     }
 
     [pscustomobject]@{
-        YtDlpPath       = [IO.Path]::GetFullPath($YtDlpPath)
-        FfmpegPath      = [IO.Path]::GetFullPath($FfmpegPath)
+        YtDlpPath         = [IO.Path]::GetFullPath($YtDlpPath)
+        FfmpegPath        = [IO.Path]::GetFullPath($FfmpegPath)
+        DenoPath          = if ($DenoPath) { [IO.Path]::GetFullPath($DenoPath) } else { '' }
         DownloadDirectory = Remove-TrailingSeparator ([IO.Path]::GetFullPath($DownloadDirectory))
     } | ConvertTo-Json | Set-Content -LiteralPath $script:ConfigPath -Encoding UTF8
 }
@@ -278,9 +285,14 @@ function Get-ExistingTools {
         throw "FFmpeg could not run: $ffmpegPath"
     }
 
+    # Deno is optional here: if it is not in this folder, beside yt-dlp.exe or
+    # on PATH, the next setup step offers to install it.
+    $denoPath = Find-JavaScriptRuntime -Directories @($directory, (Split-Path -Parent $ytDlpPath))
+
     return [pscustomobject]@{
         YtDlpPath  = $ytDlpPath
         FfmpegPath = $ffmpegPath
+        DenoPath   = $denoPath
     }
 }
 
@@ -313,6 +325,193 @@ function Remove-AppTempDirectory {
     }
 }
 
+function Enable-ModernTls {
+    # Add TLS 1.2 for Windows PowerShell 5.1 without disabling any newer
+    # protocol the system already allows.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
+
+function New-AppTempDirectory {
+    $path = Join-Path ([IO.Path]::GetTempPath()) ('EasyVideoDownloader-' + [guid]::NewGuid().ToString())
+    $null = New-Item -ItemType Directory -Path $path
+    return $path
+}
+
+function Remove-AppTempDirectoryQuietly {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    # Antivirus software often keeps a lock on a freshly downloaded .exe for
+    # a few seconds. Cleanup is best-effort so it never hides the real
+    # result of the installation.
+    try {
+        Remove-AppTempDirectory $Path
+    } catch {
+        Write-Status "Temporary files could not be removed and can be deleted later: $Path" 'Warning'
+    }
+}
+
+function Save-VerifiedDownload {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$ChecksumUrl,
+        [Parameter(Mandatory = $true)][string]$OutFile,
+        [Parameter(Mandatory = $true)][string]$ChecksumPattern,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+
+    $checksumFile = $OutFile + '.checksum'
+    Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $OutFile
+    Invoke-WebRequest -UseBasicParsing -Uri $ChecksumUrl -OutFile $checksumFile
+    $checksumText = Get-Content -LiteralPath $checksumFile -Raw
+    $match = [regex]::Match($checksumText, $ChecksumPattern)
+    if (-not $match.Success) {
+        throw "The published $Label checksum could not be read."
+    }
+    Test-DownloadedFileHash -FilePath $OutFile -ExpectedHash $match.Groups[1].Value
+}
+
+function ConvertFrom-DenoVersionText {
+    param($Text)
+
+    # "deno --version" starts with a line such as:
+    # deno 2.5.6 (stable, release, x86_64-pc-windows-msvc)
+    $match = [regex]::Match((@($Text) -join "`n"), '(?im)^deno\s+(\d+\.\d+\.\d+)')
+    if (-not $match.Success) {
+        return $null
+    }
+    return [version]$match.Groups[1].Value
+}
+
+function Test-JavaScriptRuntime {
+    param([string]$Path)
+
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+
+    $oldPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & $Path --version 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            return $false
+        }
+        $version = ConvertFrom-DenoVersionText $output
+        return (($null -ne $version) -and ($version -ge $script:MinimumDenoVersion))
+    } catch {
+        return $false
+    } finally {
+        $ErrorActionPreference = $oldPreference
+    }
+}
+
+function Find-JavaScriptRuntime {
+    param([string[]]$Directories)
+
+    foreach ($directory in @($Directories)) {
+        if (-not $directory) { continue }
+        $candidate = Find-Executable -StartPath $directory -FileName 'deno.exe'
+        if ($candidate -and (Test-JavaScriptRuntime $candidate)) {
+            return $candidate
+        }
+    }
+
+    $onPath = Get-Command 'deno.exe' -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($onPath -and (Test-JavaScriptRuntime $onPath.Path)) {
+        return $onPath.Path
+    }
+
+    return $null
+}
+
+function Install-JavaScriptRuntime {
+    param([Parameter(Mandatory = $true)][string]$InstallDirectory)
+
+    if (-not (Test-Path -LiteralPath $InstallDirectory -PathType Container)) {
+        $null = [IO.Directory]::CreateDirectory($InstallDirectory)
+    }
+
+    $tempDirectory = New-AppTempDirectory
+    $archive = Join-Path $tempDirectory 'deno.zip'
+    $extracted = Join-Path $tempDirectory 'deno'
+    $oldProgressPreference = $ProgressPreference
+    try {
+        Enable-ModernTls
+        $ProgressPreference = 'SilentlyContinue'
+
+        Write-Status 'Downloading the latest stable Deno release (JavaScript runtime used by yt-dlp)...' 'Info'
+        Write-Host 'This download is approximately 45 MB.' -ForegroundColor DarkGray
+        Save-VerifiedDownload -Url $script:DenoDownloadUrl -ChecksumUrl $script:DenoChecksumUrl -OutFile $archive `
+            -ChecksumPattern '(?i)\b([0-9a-f]{64})\b' -Label 'Deno'
+
+        Expand-Archive -LiteralPath $archive -DestinationPath $extracted -Force
+        $downloadedDeno = Get-ChildItem -LiteralPath $extracted -Filter 'deno.exe' -File -Recurse |
+            Select-Object -First 1
+        if (-not $downloadedDeno) {
+            throw 'deno.exe was not present in the downloaded archive.'
+        }
+
+        $denoPath = Join-Path $InstallDirectory 'deno.exe'
+        Copy-Item -LiteralPath $downloadedDeno.FullName -Destination $denoPath -Force
+        if (-not (Test-JavaScriptRuntime $denoPath)) {
+            throw 'The installed Deno program did not start correctly.'
+        }
+        return $denoPath
+    } finally {
+        $ProgressPreference = $oldProgressPreference
+        Remove-AppTempDirectoryQuietly $tempDirectory
+    }
+}
+
+function Resolve-JavaScriptRuntime {
+    param(
+        [string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$YtDlpPath
+    )
+
+    if ($CandidatePath -and (Test-JavaScriptRuntime $CandidatePath)) {
+        return $CandidatePath
+    }
+
+    $found = Find-JavaScriptRuntime -Directories @((Split-Path -Parent $YtDlpPath))
+    if ($found) {
+        Write-Status "JavaScript runtime found: $found" 'Success'
+        return $found
+    }
+
+    Write-Host ''
+    Write-Status 'yt-dlp needs a JavaScript runtime called Deno to read YouTube videos fully.' 'Warning'
+    Write-Host 'Without it, some formats may be missing or downloads may fail.' -ForegroundColor DarkGray
+    $answer = (Read-Host 'Download and install Deno now? [Y/n]').Trim()
+    if (($answer -ne '') -and ($answer -notmatch '^(?i)y(es)?$')) {
+        Write-Host 'You can install it later by entering S at the video URL prompt.' -ForegroundColor DarkGray
+        return $null
+    }
+
+    try {
+        $installed = Install-JavaScriptRuntime -InstallDirectory (Join-Path $script:ConfigDirectory 'tools')
+        Write-Status "Deno installed: $installed" 'Success'
+        return $installed
+    } catch {
+        Write-Status "Deno could not be installed: $($_.Exception.Message)" 'Warning'
+        Write-Host 'You can try again later by entering S at the video URL prompt.' -ForegroundColor DarkGray
+        return $null
+    }
+}
+
+function Get-JavaScriptRuntimeArguments {
+    param([Parameter(Mandatory = $true)]$Configuration)
+
+    $denoPath = Get-PropertyValue $Configuration 'DenoPath'
+    if (-not $denoPath) {
+        return @()
+    }
+    # Passing the path explicitly works even when deno.exe is not on PATH or
+    # next to yt-dlp.exe.
+    return @('--js-runtimes', "deno:$denoPath")
+}
+
 function Install-Tools {
     $defaultDirectory = Join-Path $script:ConfigDirectory 'tools'
     Write-Host ''
@@ -324,41 +523,24 @@ function Install-Tools {
         $null = [IO.Directory]::CreateDirectory($installDirectory)
     }
 
-    $tempDirectory = Join-Path ([IO.Path]::GetTempPath()) ('EasyVideoDownloader-' + [guid]::NewGuid().ToString())
-    $null = New-Item -ItemType Directory -Path $tempDirectory
+    $tempDirectory = New-AppTempDirectory
     $ytDlpDownload = Join-Path $tempDirectory 'yt-dlp.exe'
-    $ytDlpChecksums = Join-Path $tempDirectory 'SHA2-256SUMS'
     $ffmpegArchive = Join-Path $tempDirectory 'ffmpeg-release-essentials.zip'
-    $ffmpegChecksum = Join-Path $tempDirectory 'ffmpeg-release-essentials.zip.sha256'
     $ffmpegExtracted = Join-Path $tempDirectory 'ffmpeg'
 
     $oldProgressPreference = $ProgressPreference
     try {
-        # Add TLS 1.2 for Windows PowerShell 5.1 without disabling any newer
-        # protocol the system already allows.
-        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Enable-ModernTls
         $ProgressPreference = 'SilentlyContinue'
 
         Write-Status 'Downloading the latest stable yt-dlp release...' 'Info'
-        Invoke-WebRequest -UseBasicParsing -Uri $script:YtDlpDownloadUrl -OutFile $ytDlpDownload
-        Invoke-WebRequest -UseBasicParsing -Uri $script:YtDlpChecksumsUrl -OutFile $ytDlpChecksums
-        $ytChecksumText = Get-Content -LiteralPath $ytDlpChecksums -Raw
-        $ytMatch = [regex]::Match($ytChecksumText, '(?im)^([0-9a-f]{64})\s+\*?yt-dlp\.exe\s*$')
-        if (-not $ytMatch.Success) {
-            throw 'The official yt-dlp checksum could not be read.'
-        }
-        Test-DownloadedFileHash -FilePath $ytDlpDownload -ExpectedHash $ytMatch.Groups[1].Value
+        Save-VerifiedDownload -Url $script:YtDlpDownloadUrl -ChecksumUrl $script:YtDlpChecksumsUrl -OutFile $ytDlpDownload `
+            -ChecksumPattern '(?im)^([0-9a-f]{64})\s+\*?yt-dlp\.exe\s*$' -Label 'yt-dlp'
 
         Write-Status 'Downloading the latest stable FFmpeg essentials release...' 'Info'
         Write-Host 'This download is approximately 100 MB.' -ForegroundColor DarkGray
-        Invoke-WebRequest -UseBasicParsing -Uri $script:FfmpegDownloadUrl -OutFile $ffmpegArchive
-        Invoke-WebRequest -UseBasicParsing -Uri $script:FfmpegChecksumUrl -OutFile $ffmpegChecksum
-        $ffmpegChecksumText = Get-Content -LiteralPath $ffmpegChecksum -Raw
-        $ffmpegMatch = [regex]::Match($ffmpegChecksumText, '(?i)([0-9a-f]{64})')
-        if (-not $ffmpegMatch.Success) {
-            throw 'The FFmpeg checksum could not be read.'
-        }
-        Test-DownloadedFileHash -FilePath $ffmpegArchive -ExpectedHash $ffmpegMatch.Groups[1].Value
+        Save-VerifiedDownload -Url $script:FfmpegDownloadUrl -ChecksumUrl $script:FfmpegChecksumUrl -OutFile $ffmpegArchive `
+            -ChecksumPattern '(?i)\b([0-9a-f]{64})\b' -Label 'FFmpeg'
 
         Write-Status 'Installing the verified downloads...' 'Info'
         Expand-Archive -LiteralPath $ffmpegArchive -DestinationPath $ffmpegExtracted -Force
@@ -384,22 +566,26 @@ function Install-Tools {
         if (-not (Test-Executable $ffmpegPath -Arguments @('-version'))) {
             throw 'The installed FFmpeg program did not start correctly.'
         }
-
-        Write-Status "Installation complete: $installDirectory" 'Success'
-        return [pscustomobject]@{
-            YtDlpPath  = $ytDlpPath
-            FfmpegPath = $ffmpegPath
-        }
     } finally {
         $ProgressPreference = $oldProgressPreference
-        # Antivirus software often keeps a lock on a freshly downloaded .exe for
-        # a few seconds. Cleanup is best-effort so it never hides the real
-        # result of the installation.
-        try {
-            Remove-AppTempDirectory $tempDirectory
-        } catch {
-            Write-Status "Temporary files could not be removed and can be deleted later: $tempDirectory" 'Warning'
-        }
+        Remove-AppTempDirectoryQuietly $tempDirectory
+    }
+
+    # Deno goes beside yt-dlp.exe, where yt-dlp also looks for it by itself.
+    # A Deno failure does not undo the yt-dlp and FFmpeg installation; the
+    # user is offered Deno again in the next setup step.
+    $denoPath = $null
+    try {
+        $denoPath = Install-JavaScriptRuntime -InstallDirectory $installDirectory
+    } catch {
+        Write-Status "Deno could not be installed: $($_.Exception.Message)" 'Warning'
+    }
+
+    Write-Status "Installation complete: $installDirectory" 'Success'
+    return [pscustomobject]@{
+        YtDlpPath  = $ytDlpPath
+        FfmpegPath = $ffmpegPath
+        DenoPath   = $denoPath
     }
 }
 
@@ -410,11 +596,11 @@ function Initialize-Application {
     $saved = if ($ForceSetup) { $null } else { Get-SavedConfiguration }
     if ($saved -and (Test-ToolConfiguration $saved)) {
         Write-Status 'Saved yt-dlp and FFmpeg installation found.' 'Success'
-        $savedDownloadDirectory = $null
-        if (@($saved.PSObject.Properties.Name) -contains 'DownloadDirectory') {
-            $savedDownloadDirectory = $saved.DownloadDirectory
-        }
-        return (Complete-Configuration -YtDlpPath $saved.YtDlpPath -FfmpegPath $saved.FfmpegPath -SavedDownloadDirectory $savedDownloadDirectory)
+        # Settings from older versions have no DenoPath; it is then looked up
+        # or offered for installation.
+        return (Complete-Configuration -YtDlpPath $saved.YtDlpPath -FfmpegPath $saved.FfmpegPath `
+            -DenoPath (Get-PropertyValue $saved 'DenoPath') `
+            -SavedDownloadDirectory (Get-PropertyValue $saved 'DownloadDirectory'))
     }
 
     if ($saved) {
@@ -450,19 +636,22 @@ function Initialize-Application {
 
     # The download folder is chosen after the tools are ready, outside the
     # retry loop above, so a folder problem never repeats the tool setup.
-    return (Complete-Configuration -YtDlpPath $tools.YtDlpPath -FfmpegPath $tools.FfmpegPath -SavedDownloadDirectory $null)
+    return (Complete-Configuration -YtDlpPath $tools.YtDlpPath -FfmpegPath $tools.FfmpegPath `
+        -DenoPath $tools.DenoPath -SavedDownloadDirectory $null)
 }
 
 function Complete-Configuration {
     param(
         [Parameter(Mandatory = $true)][string]$YtDlpPath,
         [Parameter(Mandatory = $true)][string]$FfmpegPath,
+        [string]$DenoPath,
         [string]$SavedDownloadDirectory
     )
 
+    $resolvedDeno = Resolve-JavaScriptRuntime -CandidatePath $DenoPath -YtDlpPath $YtDlpPath
     $downloadDirectory = Get-DownloadDirectory $SavedDownloadDirectory
     try {
-        Save-Configuration -YtDlpPath $YtDlpPath -FfmpegPath $FfmpegPath -DownloadDirectory $downloadDirectory
+        Save-Configuration -YtDlpPath $YtDlpPath -FfmpegPath $FfmpegPath -DenoPath $resolvedDeno -DownloadDirectory $downloadDirectory
     } catch {
         Write-Status "Settings could not be saved, so setup will run again next time: $($_.Exception.Message)" 'Warning'
     }
@@ -470,6 +659,7 @@ function Complete-Configuration {
     return [pscustomobject]@{
         YtDlpPath         = $YtDlpPath
         FfmpegPath        = $FfmpegPath
+        DenoPath          = $resolvedDeno
         DownloadDirectory = $downloadDirectory
     }
 }
@@ -498,9 +688,10 @@ function Get-VideoInformation {
         '--no-warnings',
         '--no-playlist',
         '--encoding', 'utf-8',
-        '--ffmpeg-location', $ffmpegDirectory,
-        '--', $Url
+        '--ffmpeg-location', $ffmpegDirectory
     )
+    $arguments += @(Get-JavaScriptRuntimeArguments $Configuration)
+    $arguments += @('--', $Url)
 
     $oldPreference = $ErrorActionPreference
     try {
@@ -780,9 +971,10 @@ function Start-VideoDownload {
         '--ffmpeg-location', $ffmpegDirectory,
         '--paths', $downloadDirectory,
         '--output', $outputTemplate,
-        '--format', $FormatChoice.Selector,
-        '--', $Url
+        '--format', $FormatChoice.Selector
     )
+    $arguments += @(Get-JavaScriptRuntimeArguments $Configuration)
+    $arguments += @('--', $Url)
 
     Write-Title 'Downloading'
     Write-Host "Format: $(Get-FormatDescription $FormatChoice)"
@@ -841,6 +1033,23 @@ function Invoke-SelfTest {
     $driveRoot = [IO.Path]::GetPathRoot($tempRoot)
     if ((Remove-TrailingSeparator $driveRoot) -ne $driveRoot) { throw 'Self-test failed: a drive root was changed.' }
 
+    # Deno version detection and the yt-dlp runtime arguments.
+    $denoVersion = ConvertFrom-DenoVersionText @('deno 2.5.6 (stable, release, x86_64-pc-windows-msvc)', 'v8 14.0.365.5-rusty', 'typescript 5.9.2')
+    if ($denoVersion -ne [version]'2.5.6') { throw 'Self-test failed: Deno version was not read.' }
+    if ((ConvertFrom-DenoVersionText 'deno 1.46.3 (stable, release, x86_64-pc-windows-msvc)') -ge $script:MinimumDenoVersion) { throw 'Self-test failed: an old Deno version was accepted.' }
+    if ($null -ne (ConvertFrom-DenoVersionText 'not deno output')) { throw 'Self-test failed: unrelated text was read as a Deno version.' }
+    if (Test-JavaScriptRuntime (Join-Path $tempRoot 'missing-deno.exe')) { throw 'Self-test failed: a missing Deno was accepted.' }
+
+    $withDeno = [pscustomobject]@{ DenoPath = 'C:\Tools\Easy Video\deno.exe' }
+    $runtimeArguments = @(Get-JavaScriptRuntimeArguments $withDeno)
+    if (($runtimeArguments.Count -ne 2) -or ($runtimeArguments[0] -ne '--js-runtimes') -or ($runtimeArguments[1] -ne 'deno:C:\Tools\Easy Video\deno.exe')) {
+        throw 'Self-test failed: the Deno path was not passed to yt-dlp.'
+    }
+    $commandLine = @('--format', 'best')
+    $commandLine += @(Get-JavaScriptRuntimeArguments ([pscustomobject]@{ DenoPath = '' }))
+    $commandLine += @(Get-JavaScriptRuntimeArguments ([pscustomobject]@{ YtDlpPath = 'x' }))
+    if (($commandLine.Count -ne 2) -or ($commandLine -contains $null)) { throw 'Self-test failed: empty runtime arguments changed the command line.' }
+
     # Interactive prompts are exercised with scripted answers. Functions defined
     # inside this script block shadow Read-Host, Write-Host and Write-Status for
     # the code it calls, and disappear when the block ends.
@@ -876,6 +1085,19 @@ function Invoke-SelfTest {
         if ($folder -ne $tempRoot) { throw "Self-test failed: unexpected download folder '$folder'." }
         if (Test-Path -LiteralPath $missingFolder) { throw 'Self-test failed: a declined folder was created.' }
         if ($answers.Count -ne 0) { throw 'Self-test failed: not every scripted answer was used.' }
+
+        # Declining the Deno offer continues without downloading anything.
+        # (If this computer already has Deno on PATH, no offer is made.)
+        $statuses.Clear()
+        $answers.Enqueue('n')
+        $runtime = Resolve-JavaScriptRuntime -CandidatePath (Join-Path $tempRoot 'missing-deno.exe') -YtDlpPath (Join-Path $missingFolder 'yt-dlp.exe')
+        if ($null -eq $runtime) {
+            if ($answers.Count -ne 0) { throw 'Self-test failed: Deno was not offered when missing.' }
+            if (@($statuses | Where-Object { $_.Text -like 'Deno installed*' }).Count -ne 0) { throw 'Self-test failed: Deno was installed after being declined.' }
+        } else {
+            if (-not (Test-JavaScriptRuntime $runtime)) { throw 'Self-test failed: an unusable Deno was returned.' }
+            $answers.Clear()
+        }
     }
 
     Write-Status 'All self-tests passed.' 'Success'
